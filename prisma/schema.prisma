@@ -1,0 +1,105 @@
+// ================================================================
+//  SHIBAWRITE — DATABASE SCHEMA
+//  PostgreSQL via Prisma
+//
+//  This is the off-chain half of the system. ShibaWrite.sol only
+//  ever sees a bytes32 postId and the final numbers (wordCount,
+//  categoryId, qualityScore). Everything a human would recognize
+//  as "the post" — title, body text, scoring detail, moderation
+//  history — lives here instead, because storing that on-chain
+//  would be prohibitively expensive in gas.
+// ================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------
+//  SiweNonce — one-time challenge issued before a wallet signs in.
+//  Deleted (or left to expire) once consumed by /auth/verify.
+// ----------------------------------------------------------------
+model SiweNonce {
+  nonce     String   @id
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+}
+
+// ----------------------------------------------------------------
+//  Writer — a lightweight off-chain cache of wallet identity.
+//  The source of truth for tier/earnings is always ShibaWrite.sol;
+//  this table exists so we can attach a display name/bio and avoid
+//  hitting the RPC node on every single request.
+// ----------------------------------------------------------------
+model Writer {
+  walletAddress String   @id
+  displayName   String?
+  bio           String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  posts        Post[]
+  nonceCounter WriterNonce?
+}
+
+// ----------------------------------------------------------------
+//  WriterNonce — tracks the next EIP-712 nonce to use per writer.
+//  One row per writer (single-level relation, not a nested map) —
+//  incremented atomically inside a transaction every time a reward
+//  is signed, so two concurrent submissions can never reuse a nonce.
+// ----------------------------------------------------------------
+model WriterNonce {
+  walletAddress String @id
+  nextNonce     BigInt @default(0)
+
+  writer Writer @relation(fields: [walletAddress], references: [walletAddress])
+}
+
+// ----------------------------------------------------------------
+//  PostStatus — mirrors the decision tree from the scoring pipeline
+// ----------------------------------------------------------------
+enum PostStatus {
+  PENDING_REVIEW // grey-zone score, awaiting human moderator
+  APPROVED       // signed and ready for the writer to submit on-chain
+  REJECTED       // failed scoring, never signed
+  CLAIMED        // writer has confirmed they submitted approvePost() on-chain
+}
+
+// ----------------------------------------------------------------
+//  Post — the full off-chain record of a single submission.
+//  postId is the bytes32 hex string that ShibaWrite.sol also knows
+//  about; everything else here is invisible to the chain.
+// ----------------------------------------------------------------
+model Post {
+  id            String     @id @default(uuid())
+  postId        String     @unique // bytes32 hex string, e.g. 0xabc123...
+  writerAddress String
+  title         String
+  content       String     @db.Text
+  wordCount     Int
+  categoryId    Int // 0-5, matches the Category enum in ShibaWrite.sol
+
+  // --- Scoring results ---
+  aiGeneratedScore  Float? // 0-100, higher = more likely human-written
+  plagiarismScore   Float? // 0-100, higher = more original
+  qualityScore      Int? // 50-200 scaled x100, matches contract's QUALITY_MIN/MAX
+  rejectionReason   String?
+
+  // --- EIP-712 signed claim, once approved ---
+  rewardNonce   BigInt?
+  signature     String?
+  expiry        BigInt? // unix timestamp
+
+  status    PostStatus @default(PENDING_REVIEW)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  writer Writer @relation(fields: [writerAddress], references: [walletAddress])
+
+  @@index([writerAddress])
+  @@index([status])
+}
